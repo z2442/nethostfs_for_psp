@@ -5,12 +5,15 @@ WLAN_PROBE ?= 0
 KERNEL_BRIDGE ?= 1
 
 INCDIR =
-CFLAGS = -O2 -Wall
+CFLAGS = -O2 -Wall -G0
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
 LIBDIR =
 LIBS =
+
+PSP_PREFIX := $(shell psp-config --psp-prefix)
+LIBS += $(PSP_PREFIX)/lib/libpspav.a -lpspaudiolib -lpspaudio -lpspatrac3 -lpspmpeg -lpsputility -lpsppower
 
 ifeq ($(WLAN_PROBE),1)
 CFLAGS += -DENABLE_WLAN_SAMPLE_INIT

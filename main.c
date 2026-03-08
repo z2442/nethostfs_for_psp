@@ -100,27 +100,70 @@ clientstruct *client;
 int recv_rcode;
 int send_rcode;
 
-#define SEND_INTEGER(x) if ((send_rcode = send(sock, &x, 4, 0)) != 4) { \
-				printf("SEND_INTEGER problem not 4 bytes: %d\n", send_rcode); \
-				return -1; \
-			}
-#define RECV_INTEGER(x) if ((recv_rcode = recv(sock, x, 4, 0)) != 4) { \
-				if ((recv_rcode != 0) && (recv_rcode != -1)) \
-					printf("RECV_INTEGER problem not 4 bytes: %d\n", recv_rcode); \
-				return -1; \
-			}
-#define RECV_PARAMS() if ((recv_rcode = recv(sock, &params, sizeof(params), 0)) != sizeof(params)) { \
-				printf("RECV_PARAMS problem not sizeof(%d): %d\n", sizeof(params), recv_rcode); \
-				return -1; \
-			}
-#define SEND_RETURN(x) res = x; if ((send_rcode = send(sock, &res, 4, 0)) != 4) { \
-				printf("SEND_RETURN problem not 4 bytes: %d\n", send_rcode); \
-				return -1; \
-			}
-#define SEND_RESULT() if ((send_rcode = send(sock, &result, sizeof(result), 0)) != sizeof(result)) { \
-				printf("RECV_RESULT problem not sizeof(%d): %d\n", sizeof(result), send_rcode); \
-				return -1; \
-			}
+static int send_exact(int sock, const void *buf, size_t len)
+{
+	const unsigned char *p = (const unsigned char *)buf;
+	size_t sent = 0;
+
+	while (sent < len) {
+		ssize_t rc = send(sock, p + sent, len - sent, 0);
+		if (rc <= 0) {
+			return -1;
+		}
+		sent += (size_t)rc;
+	}
+
+	return (int)sent;
+}
+
+static int recv_exact(int sock, void *buf, size_t len)
+{
+	unsigned char *p = (unsigned char *)buf;
+	size_t received = 0;
+
+	while (received < len) {
+		ssize_t rc = recv(sock, p + received, len - received, 0);
+		if (rc <= 0) {
+			return -1;
+		}
+		received += (size_t)rc;
+	}
+
+	return (int)received;
+}
+
+#define SEND_INTEGER(x) do { \
+				if ((send_rcode = send_exact(sock, &(x), 4)) != 4) { \
+					printf("SEND_INTEGER problem not 4 bytes: %d\n", send_rcode); \
+					return -1; \
+				} \
+			} while (0)
+#define RECV_INTEGER(x) do { \
+				if ((recv_rcode = recv_exact(sock, (x), 4)) != 4) { \
+					if (recv_rcode != -1) \
+						printf("RECV_INTEGER problem not 4 bytes: %d\n", recv_rcode); \
+					return -1; \
+				} \
+			} while (0)
+#define RECV_PARAMS() do { \
+				if ((recv_rcode = recv_exact(sock, &params, sizeof(params))) != (int)sizeof(params)) { \
+					printf("RECV_PARAMS problem not sizeof(%zu): %d\n", sizeof(params), recv_rcode); \
+					return -1; \
+				} \
+			} while (0)
+#define SEND_RETURN(x) do { \
+				res = x; \
+				if ((send_rcode = send_exact(sock, &res, 4)) != 4) { \
+					printf("SEND_RETURN problem not 4 bytes: %d\n", send_rcode); \
+					return -1; \
+				} \
+			} while (0)
+#define SEND_RESULT() do { \
+				if ((send_rcode = send_exact(sock, &result, sizeof(result))) != (int)sizeof(result)) { \
+					printf("RECV_RESULT problem not sizeof(%zu): %d\n", sizeof(result), send_rcode); \
+					return -1; \
+				} \
+			} while (0)
 #define MAKE_PATH(s) snprintf(path, MAXI_PATH, "%s%s", rootdir, s)
 
 /* Converts native time to psp time */
@@ -1554,4 +1597,3 @@ int main(int argc, char *argv[])
 		}
 	}
 }
-

@@ -10,6 +10,8 @@
 #include <pspkerror.h>
 #include <pspmodulemgr.h>
 #include <pspsdk.h>
+#include <psputility_modules.h>
+#include <pspav/pspav.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #ifdef ENABLE_WLAN_SAMPLE_INIT
@@ -21,15 +23,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/errno.h>
 
 #include "../nethostfs.h"
 
 #define printf pspDebugScreenPrintf
 
 #define LAUNCHER_NAME "NetHostFSLauncher"
-#define DEFAULT_HOST "192.168.1.192"
+#define DEFAULT_HOST "192.168.1.238"
 #define DEFAULT_PORT 7513
 #define DEFAULT_PROFILE 1
 #define DEFAULT_PRX_FALLBACK "ms0:/nethostfs_psp.prx"
@@ -59,6 +63,57 @@ typedef struct BrowserSession {
 	int socks[4];
 	int channels;
 } BrowserSession;
+
+typedef struct VideoTexture {
+	int width;
+	int height;
+	int raw_stride;
+	u32 *pixels;
+} VideoTexture;
+
+static u32 *g_video_framebuffer = NULL;
+static unsigned int g_video_prev_buttons = 0;
+
+typedef struct RemoteVideoStream {
+	int sock;
+	int fd;
+} RemoteVideoStream;
+
+static RemoteVideoStream g_video_stream = { -1, -1 };
+
+typedef SceInt32 (*PspAvRingbufferCb)(ScePVoid pData, SceInt32 iNumPackets, ScePVoid pParam);
+
+/* libpspav exports these symbols even though they are not part of pspav.h. */
+extern int pspavInit(PspAvRingbufferCb cb);
+extern int pspavLoad(void);
+extern int T_pspav(void);
+extern void pspavShutdown(void);
+extern unsigned char mps_header[];
+extern int m_iLastTimeStamp;
+extern SceOff MPEGsize;
+extern SceOff MPEGcounter;
+extern SceOff MPEGstart;
+extern int pspavfd;
+extern void *MPEGdata;
+extern int dx;
+extern int dy;
+extern unsigned char playAT3;
+extern unsigned char playAV;
+extern unsigned char playAudio;
+extern int at3_started;
+extern int at3_thread_started;
+extern unsigned char is_mps;
+extern unsigned char mps_header_injected;
+extern PSPAVEntry *entry;
+extern PSPAVCallbacks *av_callbacks;
+
+typedef struct PspAvAt3ThreadData {
+	char *at3_data;
+	int at3_size;
+	int end;
+} PspAvAt3ThreadData;
+
+extern PspAvAt3ThreadData *AT3;
 
 static int exit_callback(int arg1, int arg2, void *common)
 {
@@ -267,6 +322,18 @@ static void load_network_modules(void)
 	if ((ret < 0) && (ret != 0x80111102)) {
 		printf("Load INET net module returned 0x%08X\n", ret);
 	}
+}
+
+static int load_av_module_if_needed(int module_id)
+{
+	int rc;
+
+	rc = sceUtilityLoadModule(module_id);
+	if ((rc < 0) && (rc != SCE_ERROR_MODULE_ALREADY_LOADED)) {
+		return rc;
+	}
+
+	return 0;
 }
 
 static int init_network_stack(void)
@@ -523,6 +590,103 @@ static void close_browser_session(BrowserSession *session)
 	session->channels = 0;
 }
 
+static int set_socket_nonblocking(int sock)
+{
+	int nonblock;
+
+	nonblock = 1;
+	if (sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nonblock, sizeof(nonblock)) < 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+static int wait_connect_ready(int sock, int timeout_ms)
+{
+	fd_set writefds;
+	fd_set exceptfds;
+	struct SceNetInetTimeval tv;
+	int rc;
+	int so_error;
+	socklen_t so_error_len;
+
+	if ((sock < 0) || (timeout_ms < 0)) {
+		return -1;
+	}
+
+	FD_ZERO(&writefds);
+	FD_ZERO(&exceptfds);
+	FD_SET(sock, &writefds);
+	FD_SET(sock, &exceptfds);
+
+	tv.tv_sec = (uint32_t)(timeout_ms / 1000);
+	tv.tv_usec = (uint32_t)((timeout_ms % 1000) * 1000);
+
+	rc = sceNetInetSelect(sock + 1, NULL, &writefds, &exceptfds, &tv);
+	if (rc <= 0) {
+		return -ETIMEDOUT;
+	}
+
+	so_error = 0;
+	so_error_len = (socklen_t)sizeof(so_error);
+	if (sceNetInetGetsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0) {
+		return -1;
+	}
+
+	if (FD_ISSET(sock, &exceptfds)) {
+		if (so_error != 0) {
+			return -so_error;
+		}
+		return -ECONNABORTED;
+	}
+
+	if (!FD_ISSET(sock, &writefds)) {
+		return -ETIMEDOUT;
+	}
+
+	if (so_error != 0) {
+		return -so_error;
+	}
+
+	return 0;
+}
+
+static int connect_socket_with_timeout(int sock, const struct sockaddr_in *addr, int timeout_ms)
+{
+	int rc;
+	int eno;
+	int wait_rc;
+
+	if ((sock < 0) || (addr == NULL)) {
+		return -EINVAL;
+	}
+
+	rc = sceNetInetConnect(sock, (const struct sockaddr *)addr, sizeof(*addr));
+	if (rc == 0) {
+		return 0;
+	}
+
+	eno = (int)sceNetInetGetErrno();
+	if (eno == EISCONN) {
+		return 0;
+	}
+	if ((eno != EINPROGRESS) && (eno != EALREADY) && (eno != EWOULDBLOCK) && (eno != EAGAIN)) {
+		return -eno;
+	}
+
+	wait_rc = wait_connect_ready(sock, timeout_ms);
+	if (wait_rc == -1) {
+		eno = (int)sceNetInetGetErrno();
+		if (eno == 0) {
+			eno = ETIMEDOUT;
+		}
+		return -eno;
+	}
+
+	return wait_rc;
+}
+
 static int connect_browser_session(const LauncherConfig *cfg, BrowserSession *session)
 {
 	struct sockaddr_in addr;
@@ -546,31 +710,48 @@ static int connect_browser_session(const LauncherConfig *cfg, BrowserSession *se
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = ip_addr;
-	addr.sin_port = htons((u16)cfg->port);
 
-	/* Use deterministic 4-channel setup on the base port to avoid stale half-sessions. */
+	/* nethostfs server expects 4 consecutive ports starting from the base port. */
 	for (i = 0; i < 4; i++) {
 		int sock;
 		int tries;
 		int connected = 0;
 		int last_errno = 0;
+		int target_port;
 
-		printf("Browser connect[%d] %s:%d\n", i, cfg->host, cfg->port);
-		sock = sceNetInetSocket(AF_INET, SOCK_STREAM, 0);
-		if (sock < 0) {
-			close_browser_session(session);
-			return -(910 + i);
-		}
+		target_port = cfg->port + i;
+		addr.sin_port = htons((u16)target_port);
+		printf("Browser connect[%d] %s:%d\n", i, cfg->host, target_port);
+		sock = -1;
 
 		for (tries = 0; tries < 30; tries++) {
-			if (sceNetInetConnect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+			int rc;
+			if (sock < 0) {
+				sock = sceNetInetSocket(AF_INET, SOCK_STREAM, 0);
+				if (sock < 0) {
+					last_errno = ENOBUFS;
+					break;
+				}
+				if (set_socket_nonblocking(sock) < 0) {
+					sceNetInetClose(sock);
+					sock = -1;
+					last_errno = EINVAL;
+					break;
+				}
+			}
+
+			rc = connect_socket_with_timeout(sock, &addr, 1500);
+			if (rc == 0) {
 				connected = 1;
 				break;
 			}
 
-			last_errno = (int)sceNetInetGetErrno();
-			if ((last_errno == 111) || (last_errno == 11)) {
-				sceKernelDelayThread(50 * 1000);
+			last_errno = -rc;
+			sceNetInetClose(sock);
+			sock = -1;
+			if ((last_errno == ECONNREFUSED) || (last_errno == EAGAIN) || (last_errno == EWOULDBLOCK) ||
+			    (last_errno == ETIMEDOUT) || (last_errno == EHOSTUNREACH) || (last_errno == ENETUNREACH)) {
+				sceKernelDelayThread(75 * 1000);
 				continue;
 			}
 			break;
@@ -578,7 +759,9 @@ static int connect_browser_session(const LauncherConfig *cfg, BrowserSession *se
 
 		if (!connected) {
 			printf("Browser connect[%d] failed errno=%d\n", i, last_errno);
-			sceNetInetClose(sock);
+			if (sock >= 0) {
+				sceNetInetClose(sock);
+			}
 			close_browser_session(session);
 			return -(920 + i);
 		}
@@ -686,6 +869,151 @@ static int remote_dread(int sock, int did, IO_DREAD_RESULT *out)
 	return 0;
 }
 
+static int remote_open_file(int sock, const char *path, int flags, SceMode mode)
+{
+	int cmd;
+	int fd;
+	IO_OPEN_PARAMS params;
+
+	if (path == NULL) {
+		return -1;
+	}
+
+	memset(&params, 0, sizeof(params));
+	snprintf(params.file, sizeof(params.file), "%s", path);
+	params.fs_num = 0;
+	params.flags = flags;
+	params.mode = mode;
+
+	cmd = NET_HOSTFS_CMD_IOOPEN;
+	if (send_int32(sock, cmd) < 0) {
+		return -1;
+	}
+
+	if (send_all(sock, &params, (int)sizeof(params)) < 0) {
+		return -1;
+	}
+
+	if (recv_int32(sock, &fd) < 0) {
+		return -1;
+	}
+
+	return fd;
+}
+
+static int remote_close_file(int sock, int fd)
+{
+	int cmd;
+	int res;
+
+	cmd = NET_HOSTFS_CMD_IOCLOSE;
+	if (send_int32(sock, cmd) < 0) {
+		return -1;
+	}
+
+	if (send_int32(sock, fd) < 0) {
+		return -1;
+	}
+
+	if (recv_int32(sock, &res) < 0) {
+		return -1;
+	}
+
+	return res;
+}
+
+static int remote_lseek_file(int sock, int fd, SceOff offset, int whence)
+{
+	int cmd;
+	int res;
+	IO_LSEEK_PARAMS params;
+
+	memset(&params, 0, sizeof(params));
+	params.fd = fd;
+	params.offset = offset;
+	params.whence = whence;
+
+	cmd = NET_HOSTFS_CMD_IOLSEEK;
+	if (send_int32(sock, cmd) < 0) {
+		return -1;
+	}
+
+	if (send_all(sock, &params, (int)sizeof(params)) < 0) {
+		return -1;
+	}
+
+	if (recv_int32(sock, &res) < 0) {
+		return -1;
+	}
+
+	return res;
+}
+
+static int remote_read_file(int sock, int fd, void *buf, int len)
+{
+	int cmd;
+	int res;
+	IO_READ_PARAMS params;
+
+	if ((buf == NULL) || (len <= 0)) {
+		return -1;
+	}
+
+	memset(&params, 0, sizeof(params));
+	params.fd = fd;
+	params.len = len;
+
+	cmd = NET_HOSTFS_CMD_IOREAD;
+	if (send_int32(sock, cmd) < 0) {
+		return -1;
+	}
+
+	if (send_all(sock, &params, (int)sizeof(params)) < 0) {
+		return -1;
+	}
+
+	if (recv_int32(sock, &res) < 0) {
+		return -1;
+	}
+
+	if (res <= 0) {
+		return res;
+	}
+
+	if (res > len) {
+		return -1;
+	}
+
+	if (recv_all(sock, buf, res) < 0) {
+		return -1;
+	}
+
+	return res;
+}
+
+static int remote_read_exact(int sock, int fd, unsigned char *buf, int len)
+{
+	int total;
+
+	if ((buf == NULL) || (len <= 0)) {
+		return -1;
+	}
+
+	total = 0;
+	while (total < len) {
+		int rc = remote_read_file(sock, fd, buf + total, len - total);
+		if (rc < 0) {
+			return -1;
+		}
+		if (rc == 0) {
+			break;
+		}
+		total += rc;
+	}
+
+	return total;
+}
+
 static int path_is_root(const char *path)
 {
 	return (path != NULL) && ((strcmp(path, "/") == 0) || (path[0] == '\0'));
@@ -749,6 +1077,546 @@ static void path_join(char *out, size_t out_size, const char *base, const char *
 	}
 }
 
+static unsigned char ascii_lower(unsigned char ch)
+{
+	if ((ch >= 'A') && (ch <= 'Z')) {
+		return (unsigned char)(ch + ('a' - 'A'));
+	}
+	return ch;
+}
+
+static int has_extension_ci(const char *name, const char *ext)
+{
+	size_t name_len;
+	size_t ext_len;
+	size_t i;
+
+	if ((name == NULL) || (ext == NULL)) {
+		return 0;
+	}
+
+	name_len = strlen(name);
+	ext_len = strlen(ext);
+	if (name_len < ext_len) {
+		return 0;
+	}
+
+	for (i = 0; i < ext_len; i++) {
+		unsigned char a = ascii_lower((unsigned char)name[name_len - ext_len + i]);
+		unsigned char b = ascii_lower((unsigned char)ext[i]);
+		if (a != b) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+static void wait_for_buttons_released(void)
+{
+	SceCtrlData pad;
+
+	while (1) {
+		sceCtrlReadBufferPositive(&pad, 1);
+		if (pad.Buttons == 0) {
+			break;
+		}
+		sceDisplayWaitVblankStart();
+	}
+}
+
+static void wait_for_circle_to_continue(void)
+{
+	SceCtrlData pad;
+	SceCtrlData prev_pad;
+
+	memset(&prev_pad, 0, sizeof(prev_pad));
+	while (1) {
+		unsigned int pressed;
+		sceCtrlReadBufferPositive(&pad, 1);
+		pressed = pad.Buttons & ~prev_pad.Buttons;
+		prev_pad = pad;
+		if (pressed & PSP_CTRL_CIRCLE) {
+			break;
+		}
+		sceDisplayWaitVblankStart();
+	}
+
+	wait_for_buttons_released();
+}
+
+static PSPAV_PadState video_get_pad_state(void)
+{
+	SceCtrlData pad;
+	unsigned int pressed;
+
+	sceCtrlReadBufferPositive(&pad, 1);
+	pressed = pad.Buttons & ~g_video_prev_buttons;
+	g_video_prev_buttons = pad.Buttons;
+
+	if (pressed & PSP_CTRL_CIRCLE) {
+		return PAD_USER_CANCEL;
+	}
+
+	return PAD_NONE;
+}
+
+static void video_clear_screen(unsigned int color)
+{
+	int y;
+
+	if (g_video_framebuffer == NULL) {
+		return;
+	}
+
+	for (y = 0; y < 272; y++) {
+		int x;
+		u32 *row = g_video_framebuffer + (y * 512);
+		for (x = 0; x < 512; x++) {
+			row[x] = color;
+		}
+	}
+}
+
+static void video_flip_screen(void)
+{
+	if (g_video_framebuffer == NULL) {
+		return;
+	}
+
+	sceKernelDcacheWritebackInvalidateRange(g_video_framebuffer, 512 * 272 * (int)sizeof(u32));
+	sceDisplaySetFrameBuf(g_video_framebuffer, 512, PSP_DISPLAY_PIXEL_FORMAT_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
+}
+
+static void video_flush_texture(void *texture)
+{
+	VideoTexture *tex = (VideoTexture *)texture;
+	if ((tex == NULL) || (tex->pixels == NULL)) {
+		return;
+	}
+
+	sceKernelDcacheWritebackInvalidateRange(
+		tex->pixels,
+		tex->raw_stride * tex->height * (int)sizeof(u32)
+	);
+}
+
+static void *video_get_raw_texture(void *texture)
+{
+	VideoTexture *tex = (VideoTexture *)texture;
+	if (tex == NULL) {
+		return NULL;
+	}
+	return tex->pixels;
+}
+
+static void *video_create_texture(int width, int height)
+{
+	VideoTexture *tex;
+	int alloc_stride;
+
+	if ((width <= 0) || (height <= 0)) {
+		return NULL;
+	}
+
+	tex = (VideoTexture *)malloc(sizeof(*tex));
+	if (tex == NULL) {
+		return NULL;
+	}
+
+	alloc_stride = ((width >= 512) && (height >= 272)) ? 512 : width;
+	tex->width = width;
+	tex->height = height;
+	tex->raw_stride = alloc_stride;
+	tex->pixels = (u32 *)memalign(64, alloc_stride * height * (int)sizeof(u32));
+	if (tex->pixels == NULL) {
+		free(tex);
+		return NULL;
+	}
+
+	memset(tex->pixels, 0, alloc_stride * height * (int)sizeof(u32));
+	return tex;
+}
+
+static void video_free_texture(void *texture)
+{
+	VideoTexture *tex = (VideoTexture *)texture;
+	if (tex == NULL) {
+		return;
+	}
+
+	if (tex->pixels != NULL) {
+		free(tex->pixels);
+	}
+	free(tex);
+}
+
+static void video_draw_texture(void *texture, int x, int y)
+{
+	VideoTexture *tex;
+	int src_x;
+	int src_y;
+	int dst_x;
+	int dst_y;
+	int copy_w;
+	int copy_h;
+	int src_w;
+	int row;
+
+	tex = (VideoTexture *)texture;
+	if ((tex == NULL) || (tex->pixels == NULL) || (g_video_framebuffer == NULL)) {
+		return;
+	}
+
+	src_w = tex->width;
+	if (src_w > tex->raw_stride) {
+		src_w = tex->raw_stride;
+	}
+
+	src_x = 0;
+	src_y = 0;
+	dst_x = x;
+	dst_y = y;
+
+	if (dst_x < 0) {
+		src_x = -dst_x;
+		dst_x = 0;
+	}
+	if (dst_y < 0) {
+		src_y = -dst_y;
+		dst_y = 0;
+	}
+
+	copy_w = 480 - dst_x;
+	copy_h = 272 - dst_y;
+	if (copy_w > (src_w - src_x)) {
+		copy_w = src_w - src_x;
+	}
+	if (copy_h > (tex->height - src_y)) {
+		copy_h = tex->height - src_y;
+	}
+
+	if ((copy_w <= 0) || (copy_h <= 0)) {
+		return;
+	}
+
+	for (row = 0; row < copy_h; row++) {
+		u32 *dst = g_video_framebuffer + ((dst_y + row) * 512) + dst_x;
+		u32 *src = tex->pixels + ((src_y + row) * tex->raw_stride) + src_x;
+		memcpy(dst, src, copy_w * (int)sizeof(u32));
+	}
+}
+
+static void video_set_texture_alpha(void *texture, int alpha)
+{
+	(void)texture;
+	(void)alpha;
+}
+
+static PSPAVCallbacks g_video_callbacks = {
+	video_get_pad_state,
+	video_clear_screen,
+	video_flip_screen,
+	video_flush_texture,
+	video_get_raw_texture,
+	video_create_texture,
+	video_free_texture,
+	video_draw_texture,
+	video_set_texture_alpha
+};
+
+static void stream_copy_mps_header(unsigned char *dst)
+{
+	if (dst == NULL) {
+		return;
+	}
+
+	memset(dst, 0, 2048);
+	memcpy(dst, mps_header, 12);
+	memcpy(dst + 12, &MPEGsize, 8);
+	memcpy(dst + 92, &m_iLastTimeStamp, 4);
+	memcpy(dst + 118, &m_iLastTimeStamp, 4);
+}
+
+static SceInt32 stream_ringbuffer_callback(ScePVoid pData, SceInt32 iNumPackets, ScePVoid pParam)
+{
+	unsigned char *dst;
+	int packets_target;
+	int packets_written;
+
+	(void)pParam;
+
+	if ((pData == NULL) || (iNumPackets <= 0) || (g_video_stream.fd < 0)) {
+		return 0;
+	}
+
+	dst = (unsigned char *)pData;
+	packets_target = iNumPackets;
+	if (packets_target > 16) {
+		packets_target = 16;
+	}
+	packets_written = 0;
+
+	if ((is_mps != 0) && (MPEGcounter == 0) && (mps_header_injected == 0)) {
+		stream_copy_mps_header(dst);
+		mps_header_injected = 1;
+		packets_written = 1;
+		if (packets_target == 1) {
+			return packets_written;
+		}
+		dst += 2048;
+		packets_target--;
+	}
+
+	while (packets_target > 0) {
+		int bytes_to_read;
+		int bytes_read;
+		int packets_read;
+
+		if (MPEGcounter >= MPEGsize) {
+			if (remote_lseek_file(g_video_stream.sock, g_video_stream.fd, MPEGstart, PSP_SEEK_SET) < 0) {
+				break;
+			}
+			MPEGcounter = MPEGstart;
+		}
+
+		bytes_to_read = packets_target * 2048;
+		bytes_read = remote_read_exact(g_video_stream.sock, g_video_stream.fd, dst, bytes_to_read);
+		if (bytes_read <= 0) {
+			break;
+		}
+
+		packets_read = bytes_read / 2048;
+		if (packets_read <= 0) {
+			break;
+		}
+
+		bytes_read = packets_read * 2048;
+		MPEGcounter += (SceOff)bytes_read;
+		packets_written += packets_read;
+		packets_target -= packets_read;
+		dst += bytes_read;
+
+		if (packets_read * 2048 < bytes_to_read) {
+			break;
+		}
+	}
+
+	return packets_written;
+}
+
+static int play_remote_video_stream(int sock, const char *remote_path, int treat_as_mps)
+{
+	unsigned char header[2048];
+	int fd;
+	int size_end;
+	int init_ok;
+	int res;
+	int av_rc;
+
+	if (remote_path == NULL) {
+		return -0x720;
+	}
+
+	fd = -1;
+	fd = remote_open_file(sock, remote_path, PSP_O_RDONLY, 0);
+	if (fd < 0) {
+		return -0x721;
+	}
+
+	g_video_stream.sock = sock;
+	g_video_stream.fd = fd;
+	init_ok = 0;
+	res = -0x72F;
+
+	size_end = remote_lseek_file(sock, fd, 0, PSP_SEEK_END);
+	if (size_end < 0) {
+		res = -0x722;
+		goto cleanup;
+	}
+
+	MPEGsize = (SceOff)size_end;
+	MPEGcounter = 0;
+	MPEGstart = 0;
+
+	if (remote_lseek_file(sock, fd, 0, PSP_SEEK_SET) < 0) {
+		res = -0x723;
+		goto cleanup;
+	}
+
+	memset(header, 0, sizeof(header));
+	if (!treat_as_mps) {
+		int got = remote_read_exact(sock, fd, header, (int)sizeof(header));
+		if (got < 0) {
+			res = -0x724;
+			goto cleanup;
+		}
+		if (got < (int)sizeof(header)) {
+			memset(header + got, 0, (int)sizeof(header) - got);
+		}
+		if (remote_lseek_file(sock, fd, 0, PSP_SEEK_SET) < 0) {
+			res = -0x725;
+			goto cleanup;
+		}
+	}
+
+	is_mps = treat_as_mps ? 1 : 0;
+	mps_header_injected = 0;
+	playAT3 = 0;
+	playAV = 1;
+	playAudio = 0;
+	entry = NULL;
+	av_callbacks = &g_video_callbacks;
+	pspavfd = -1;
+	MPEGdata = treat_as_mps ? NULL : (void *)header;
+
+	if (AT3 != NULL) {
+		AT3->at3_data = NULL;
+		AT3->at3_size = 0;
+		AT3->end = 0;
+	}
+
+	at3_started = 0;
+	at3_thread_started = 0;
+	dx = 0;
+	dy = 0;
+
+	if (g_video_framebuffer == NULL) {
+		g_video_framebuffer = (u32 *)memalign(64, 512 * 272 * (int)sizeof(u32));
+		if (g_video_framebuffer == NULL) {
+			res = -0x726;
+			goto cleanup;
+		}
+	}
+	memset(g_video_framebuffer, 0, 512 * 272 * (int)sizeof(u32));
+	g_video_prev_buttons = 0;
+
+	sceCtrlSetSamplingCycle(0);
+	sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
+
+	/* Some firmwares require these AV modules linked before sceMpeg setup. */
+	av_rc = load_av_module_if_needed(PSP_MODULE_AV_AVCODEC);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+	av_rc = load_av_module_if_needed(PSP_MODULE_AV_SASCORE);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+	av_rc = load_av_module_if_needed(PSP_MODULE_AV_ATRAC3PLUS);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+	av_rc = load_av_module_if_needed(PSP_MODULE_AV_MPEGBASE);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+	av_rc = load_av_module_if_needed(PSP_MODULE_AV_VAUDIO);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+	av_rc = load_av_module_if_needed(PSP_MODULE_AV_AAC);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+
+	av_rc = pspavInit(stream_ringbuffer_callback);
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+	init_ok = 1;
+
+	av_rc = pspavLoad();
+	if (av_rc < 0) {
+		res = av_rc;
+		goto cleanup;
+	}
+
+	if (remote_lseek_file(sock, fd, MPEGstart, PSP_SEEK_SET) >= 0) {
+		MPEGcounter = MPEGstart;
+	}
+
+	(void)T_pspav();
+	res = 0;
+
+cleanup:
+	if (init_ok) {
+		pspavShutdown();
+	}
+	MPEGdata = NULL;
+	if (fd >= 0) {
+		(void)remote_close_file(sock, fd);
+	}
+	g_video_stream.sock = -1;
+	g_video_stream.fd = -1;
+	pspDebugScreenInit();
+	sceCtrlSetSamplingCycle(0);
+	sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
+	wait_for_buttons_released();
+	return res;
+}
+
+static int play_selected_video_file(int sock, const char *dir_path, const BrowserEntry *entry_info)
+{
+	char remote_path[256];
+	int treat_as_mps;
+	int rc;
+
+	if ((dir_path == NULL) || (entry_info == NULL)) {
+		return -1;
+	}
+
+	if (has_extension_ci(entry_info->name, ".mp4")) {
+		pspDebugScreenClear();
+		printf("MP4 playback is not supported by this PSP runtime.\n");
+		printf("Use .pmf or .mps for in-launcher playback.\n");
+		printf("\nPress O to return.\n");
+		wait_for_circle_to_continue();
+		return 0;
+	}
+
+	if (has_extension_ci(entry_info->name, ".mps")) {
+		treat_as_mps = 1;
+	} else if (has_extension_ci(entry_info->name, ".pmf")) {
+		treat_as_mps = 0;
+	} else {
+		pspDebugScreenClear();
+		printf("Selected file is not a supported video type.\n");
+		printf("Supported: .pmf, .mps\n");
+		printf("\nPress O to return.\n");
+		wait_for_circle_to_continue();
+		return 0;
+	}
+
+	path_join(remote_path, sizeof(remote_path), dir_path, entry_info->name);
+	if (remote_path[0] == '\0') {
+		return -1;
+	}
+
+	pspDebugScreenClear();
+	printf("Streaming video:\n%s\n", remote_path);
+	printf("\nPlayback controls:\n");
+	printf("O Stop and return to browser\n");
+	printf("\nLoading stream...\n");
+
+	rc = play_remote_video_stream(sock, remote_path, treat_as_mps);
+	if (rc < 0) {
+		pspDebugScreenClear();
+		printf("Video stream failed: 0x%08X\n", rc);
+		printf("\nPress O to return.\n");
+		wait_for_circle_to_continue();
+	}
+
+	return rc;
+}
+
 static int load_directory_entries(int sock, const char *path, BrowserEntry *entries, int max_entries)
 {
 	int did;
@@ -795,7 +1663,7 @@ static void draw_browser(const char *path, const BrowserEntry *entries, int coun
 	pspDebugScreenSetXY(0, 0);
 	printf("NetHostFS Browser\n");
 	printf("Path: %s\n", path);
-	printf("Up/Down Move  X Enter  O Up  TRI Reload  START Exit\n");
+	printf("Up/Down Move  X Enter/Play  O Up/Back  TRI Reload  START Exit\n");
 	printf("-----------------------------------------------------\n");
 
 	for (i = 0; i < BROWSER_VISIBLE_LINES; i++) {
@@ -948,6 +1816,10 @@ static int run_file_browser(const LauncherConfig *cfg)
 							needs_reload = 1;
 						}
 					}
+				} else {
+					(void)play_selected_video_file(sock, path, &entries[selected]);
+					needs_redraw = 1;
+					memset(&prev_pad, 0, sizeof(prev_pad));
 				}
 			}
 

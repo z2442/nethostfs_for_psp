@@ -56,10 +56,13 @@ Example:
 - On each port, it sends `NET_HOSTFS_CMD_HELLO` and expects `NET_HOSTFS_CMD_HELLO` back.
 - Browser controls:
 - `Up/Down`: move selection
-- `Cross`: enter selected directory
+- `Cross`: enter selected directory, or play selected `.pmf`/`.mps` file
 - `Circle`: go up one directory
 - `Triangle`: refresh current directory
 - `Start`: exit browser
+- Video playback is streamed directly from NetHostFS (no temporary local copy).
+- In video playback, press `Circle` to stop and return to the browser.
+- `.mp4` is currently not supported by the in-launcher PSP playback path.
 - If profile auto-connect fails, launcher stops before PRX start and prints the connect error.
 - If the selected profile is invalid (`0x80110601`), launcher auto-falls back to the first configured profile.
 - `WLAN_PROBE=1` enables `sceWlan*` checks (switch/power/MAC) like the PSPSDK sample.

@@ -5,15 +5,15 @@
 #include <stdint.h>
 
 #ifndef u8
-#define u8	unsigned char
+#define u8	uint8_t
 #endif 
 
 #ifndef u16
-#define	u16	unsigned short
+#define	u16	uint16_t
 #endif
 
 #ifndef u32
-#define u32	unsigned long
+#define u32	uint32_t
 #endif
 
 #define PSP_O_RDONLY	0x0001
@@ -151,8 +151,11 @@ typedef struct SceIoDirent
 	SceIoStat 	d_stat;
 	/** File name. */
 	char 		d_name[256];
-	/** Device-specific data. */
-	void * 		d_private;
+	/**
+	 * PSP ABI uses a 32-bit pointer here. Keep it fixed-width in the host
+	 * shim so wire structs are stable on 64-bit hosts.
+	 */
+	uint32_t 	d_private;
 	int 		dummy;
 } SceIoDirent;
 
